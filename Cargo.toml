@@ -1,0 +1,16 @@
+[package]
+name = "concord-agent-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "*"
+ezsockets = { version = "*", features = ["client"] }
+http = "*"
+reqwest = { version = "*", features = ["json"] }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+tokio = { version = "*", features = ["full"] }
+tracing = "*"
+tracing-subscriber = "*"
+url = "*"
