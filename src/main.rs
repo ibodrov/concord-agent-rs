@@ -1,43 +1,26 @@
-use async_trait::async_trait;
-use ezsockets::ClientConfig;
-use std::{env, io::BufRead};
-
-struct Client {}
-
-#[async_trait]
-impl ezsockets::ClientExt for Client {
-    type Call = ();
-
-    async fn on_text(&mut self, text: String) -> Result<(), ezsockets::Error> {
-        tracing::info!("received message: {text}");
-        Ok(())
-    }
-
-    async fn on_binary(&mut self, bytes: Vec<u8>) -> Result<(), ezsockets::Error> {
-        tracing::info!("received bytes: {bytes:?}");
-        Ok(())
-    }
-
-    async fn on_call(&mut self, call: Self::Call) -> Result<(), ezsockets::Error> {
-        let () = call;
-        Ok(())
-    }
-}
+use http::{Request, Uri};
+use tokio_tungstenite::connect_async;
+use tracing::info;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let config = ClientConfig::new("ws://localhost:8001/websocket")
-        .header(http::header::AUTHORIZATION, env::var("API_KEY").unwrap());
-    let (handle, future) = ezsockets::connect(|_client| Client {}, config).await;
-    tokio::spawn(async move {
-        future.await.unwrap();
-    });
-    let stdin = std::io::stdin();
-    let lines = stdin.lock().lines();
-    for line in lines {
-        let line = line.unwrap();
-        tracing::info!("sending {line}");
-        handle.text(line).unwrap();
-    }
+
+    let api_key = std::env::var("SERVER_API_KEY").expect("SERVER_API_KEY must be set");
+    let uri = Uri::from_static("ws://localhost:8001/websocket");
+    let host = uri.host().expect("Invalid host in WebSocket URL");
+
+    let request = Request::builder()
+        .uri(&uri)
+        .header("Host", host)
+        .header("Authorization", api_key)
+        .header("Connection", "upgrade")
+        .header("Upgrade", "websocket")
+        .header("sec-websocket-key", "concord-agent-rs")
+        .header("sec-websocket-version", 13)
+        .body(())
+        .unwrap();
+    let (ws_session, _) = connect_async(request).await.unwrap();
+
+    info!("Connected to {}", uri);
 }
