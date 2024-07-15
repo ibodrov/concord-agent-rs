@@ -16,6 +16,7 @@ async fn main() {
         .header("Authorization", api_key)
         .header("Connection", "upgrade")
         .header("Upgrade", "websocket")
+        .header("User-Agent", "concord-agent-rs")
         .header("sec-websocket-key", "concord-agent-rs")
         .header("sec-websocket-version", 13)
         .body(())
@@ -24,3 +25,4 @@ async fn main() {
 
     info!("Connected to {}", uri);
 }
+
