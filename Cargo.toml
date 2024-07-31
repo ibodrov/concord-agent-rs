@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-http = "*"
-reqwest = { version = "*", features = ["json"] }
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-tokio = { version = "*", features = ["full"] }
-tokio-tungstenite = "*"
-tracing = "*"
-tracing-subscriber = "*"
-url = "*"
+dotenvy = "0.15.7"
+futures-util = "0.3.30"
+http = "1.1.0"
+serde = { version = "1.0.204", features = ["derive"] }
+serde_json = "1.0.120"
+tokio = { version = "1.39.1", features = ["full"] }
+tokio-tungstenite = "0.23.1"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+uuid = { version = "1.10.0", features = ["serde"] }
+concord-client = { path = "../concord-client-rs" }
