@@ -1,21 +1,39 @@
 use std::{env, sync::Arc, time::Duration};
 
-use concord_client::{Config, Message, QueueClient};
+use concord_client::{
+    api_client::{self, ApiClient},
+    model::{AgentId, ProcessStatus},
+    queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
+};
 use dotenvy::dotenv;
+use error::AppError;
 use http::Uri;
-use tokio::{sync::Mutex, time::{interval, sleep}};
-use tracing::{error, info};
+use serde_json::json;
+use tokio::time::sleep;
+use tracing::{info, warn};
+use url::Url;
+use uuid::Uuid;
 
-#[derive(Debug)]
-struct AppError {
-    message: String,
-}
+mod error {
+    #[derive(Debug)]
+    pub struct AppError {
+        message: String,
+    }
 
-impl std::error::Error for AppError {}
+    impl AppError {
+        pub fn new(message: &str) -> Self {
+            Self {
+                message: message.to_string(),
+            }
+        }
+    }
 
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+    impl std::error::Error for AppError {}
+
+    impl std::fmt::Display for AppError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
     }
 }
 
@@ -25,46 +43,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     dotenv().ok();
 
+    let agent_id = AgentId(Uuid::default());
+
     let uri = "ws://localhost:8001/websocket".parse::<Uri>()?;
     info!("Connecting to {}", uri);
 
-    let auth_header = env::var("AUTHORIZATION_HEADER").map_err(|_| AppError {
-        message: "AUTHORIZATION_HEADER is not set".to_string(),
-    })?;
+    let auth_header = env::var("AUTHORIZATION_HEADER")
+        .map_err(|_| AppError::new("AUTHORIZATION_HEADER is not set"))?;
 
-    let config = Config { uri, auth_header };
-    let queue_client = Arc::new(Mutex::new(QueueClient::connect(config).await?));
+    let queue_client = Arc::new(
+        QueueClient::connect(queue_client::Config {
+            agent_id,
+            uri,
+            auth_header: auth_header.clone(),
+            capabilities: json!({"runtime": "rs"}),
+            ping_interval: Duration::from_secs(10),
+        })
+        .await?,
+    );
     info!("Connected to the server");
 
-    // ping the server every 30 seconds
-    let ping_interval = Duration::from_secs(10);
-    let ping_client = queue_client.clone();
-    tokio::spawn(async move {
-        loop {
-            sleep(ping_interval).await;
-            let mut queue_client = ping_client.lock().await;
-            if let Err(err) = queue_client.send_message(Message::Ping).await {
-                error!("Failed to send ping message: {}", err);
+    let correlation_id_gen = CorrelationIdGenerator::new();
+
+    let api_client = ApiClient::new(api_client::Config {
+        base_url: Url::parse("http://localhost:8001")?,
+        auth_header,
+    })?;
+
+    let process_handler = {
+        let queue_client = queue_client.clone();
+        let correlation_id_gen = correlation_id_gen.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("Waiting for next process...");
+                let correlation_id = correlation_id_gen.next();
+                match queue_client.next_process(correlation_id).await {
+                    Ok(ProcessResponse { process_id, .. }) => {
+                        info!("Got process: {process_id}");
+                        if let Err(e) = api_client
+                            .update_status(process_id, agent_id, ProcessStatus::Running)
+                            .await
+                        {
+                            warn!("Error while updating process status: {e}");
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Error while getting next process: {e}");
+                        warn!("Retrying in 5 seconds...");
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
             }
-            info!("Sent ping message");
+        })
+    };
+
+    let command_handler = tokio::spawn(async move {
+        loop {
+            info!("Waiting for next command...");
+            let correlation_id = correlation_id_gen.next();
+            match queue_client.next_command(correlation_id).await {
+                Ok(cmd) => {
+                    info!("Got command: {cmd:?}");
+                }
+                Err(e) => {
+                    warn!("Error while getting next command: {e}");
+                    warn!("Retrying in 5 seconds...");
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
     });
 
-    loop {
-        info!("Waiting for messages");
+    tokio::try_join!(process_handler, command_handler)?;
 
-        let mut queue_client = queue_client.lock().await;
-        match queue_client.receive_message().await? {
-            Message::CommandResponse { correlation_id } => todo!(),
-            Message::ProcessResponse { correlation_id, session_token, process_id } => todo!(),
-            Message::Ping => {
-                queue_client.send_message(Message::Pong).await?;
-                info!("Sent pong message");
-            },
-            Message::Pong => {},
-            _ => {}
-        }
-
-        sleep(Duration::from_secs(5)).await;
-    }
+    Ok(())
 }
