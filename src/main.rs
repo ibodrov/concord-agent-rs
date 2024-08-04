@@ -128,11 +128,13 @@ async fn handle_process(
         api_token,
     })?;
 
-    api_client
+    let process_api = api_client.process_api();
+
+    process_api
         .update_status(process_id, agent_id, ProcessStatus::Running)
         .await?;
 
-    api_client
+    process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)
         .await?;
 
