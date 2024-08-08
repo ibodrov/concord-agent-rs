@@ -1,4 +1,9 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_zip::base::read::seek::ZipFileReader;
 use concord_client::{
@@ -13,15 +18,20 @@ use dotenvy::dotenv;
 use error::AppError;
 use http::Uri;
 use serde_json::json;
-use tokio::{fs::File, io::BufReader, time::sleep};
-use tracing::{debug, info, warn};
+use tokio::{
+    fs::{create_dir_all, File, OpenOptions},
+    io::BufReader,
+    time::sleep,
+};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
 mod error {
     #[derive(Debug)]
     pub struct AppError {
-        message: String,
+        pub message: String,
     }
 
     impl AppError {
@@ -30,6 +40,15 @@ mod error {
                 message: message.to_string(),
             }
         }
+    }
+
+    #[macro_export]
+    macro_rules! app_error {
+        ($($arg:tt)*) => {
+            AppError {
+                message: format!($($arg)*),
+            }
+        };
     }
 
     impl std::error::Error for AppError {}
@@ -86,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) =
                             handle_process(agent_id, api_token.clone(), process_id).await
                         {
-                            warn!("Process error: {e}");
+                            error!("{e}");
                             continue;
                         }
                     }
@@ -138,14 +157,9 @@ async fn handle_process(
     let state_file_path = process_api.download_state(process_id).await?;
     {
         let file = File::open(state_file_path).await?;
-        let zip = ZipFileReader::with_tokio(BufReader::new(file)).await?;
-        for entry in zip.file().entries() {
-            let filename = &entry
-                .filename()
-                .as_str()
-                .map_err(|e| AppError::new(&format!("Process state archive error: {e}")))?;
-            info!("Entry: {filename:?}");
-        }
+        let out_dir = PathBuf::from("/tmp").join(process_id.to_string());
+        unzip(file, &out_dir).await?;
+        debug!("State file extracted to {out_dir:?}");
     }
 
     process_api
@@ -176,6 +190,50 @@ async fn handle_process(
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)
         .await?;
+
+    Ok(())
+}
+
+fn sanitize_file_path(path: &str) -> PathBuf {
+    path.replace('\\', "/")
+        .split('/') // TODO sanitize components
+        .collect()
+}
+
+async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let archive = BufReader::new(archive_file).compat();
+    let mut reader = ZipFileReader::new(archive).await?;
+    for index in 0..reader.file().entries().len() {
+        let entry = reader.file().entries().get(index).unwrap();
+        let path = out_dir.join(sanitize_file_path(entry.filename().as_str().unwrap()));
+
+        let entry_is_dir = entry.dir()?;
+        if entry_is_dir {
+            if !path.exists() {
+                create_dir_all(&path).await?;
+            }
+        } else {
+            let mut entry_reader = reader.reader_without_entry(index).await?;
+
+            let parent = path.parent().ok_or_else(|| {
+                app_error!("Failed to get parent path of the target file: {path:?}")
+            })?;
+            if !parent.is_dir() {
+                create_dir_all(parent)
+                    .await
+                    .expect("Failed to create parent directories");
+            }
+            let writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+                .expect("Failed to create extracted file");
+            futures_util::io::copy(&mut entry_reader, &mut writer.compat_write())
+                .await
+                .expect("Failed to copy to extracted file");
+        }
+    }
 
     Ok(())
 }
