@@ -1,15 +1,19 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
+use async_zip::base::read::seek::ZipFileReader;
 use concord_client::{
     api_client::{self, ApiClient},
-    model::{AgentId, ApiToken, ProcessId, ProcessStatus},
+    model::{
+        AgentId, ApiToken, LogSegmentRequest, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId,
+        ProcessStatus, SegmentCorrelationId,
+    },
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
 use dotenvy::dotenv;
 use error::AppError;
 use http::Uri;
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::{fs::File, io::BufReader, time::sleep};
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -126,12 +130,47 @@ async fn handle_process(
     let api_client = ApiClient::new(api_client::Config {
         base_url: Url::parse("http://localhost:8001")?,
         api_token,
+        temp_dir: PathBuf::from("/tmp"),
     })?;
 
     let process_api = api_client.process_api();
 
+    let state_file_path = process_api.download_state(process_id).await?;
+    {
+        let file = File::open(state_file_path).await?;
+        let zip = ZipFileReader::with_tokio(BufReader::new(file)).await?;
+        for entry in zip.file().entries() {
+            let filename = &entry
+                .filename()
+                .as_str()
+                .map_err(|e| AppError::new(&format!("Process state archive error: {e}")))?;
+            info!("Entry: {filename:?}");
+        }
+    }
+
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Running)
+        .await?;
+
+    let segment_id = process_api
+        .create_log_segment(
+            process_id,
+            &LogSegmentRequest {
+                correlation_id: SegmentCorrelationId::new(Uuid::default()),
+                name: "test".to_owned(),
+            },
+        )
+        .await?;
+
+    process_api
+        .update_log_segment(
+            process_id,
+            segment_id,
+            &LogSegmentUpdateRequest {
+                status: Some(LogSegmentStatus::Ok),
+                ..Default::default()
+            },
+        )
         .await?;
 
     process_api
