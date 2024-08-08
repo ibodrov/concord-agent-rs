@@ -1,5 +1,7 @@
 use std::{
     env,
+    fs::Permissions,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -19,7 +21,7 @@ use error::AppError;
 use http::Uri;
 use serde_json::json;
 use tokio::{
-    fs::{create_dir_all, File, OpenOptions},
+    fs::{self, create_dir_all, File, OpenOptions},
     io::BufReader,
     time::sleep,
 };
@@ -62,11 +64,12 @@ mod error {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
     dotenv().ok();
 
+    tracing_subscriber::fmt::init();
+
     let agent_id = AgentId(Uuid::default());
+    debug!("Agent ID: {agent_id}");
 
     let uri = "ws://localhost:8001/websocket".parse::<Uri>()?;
     info!("Connecting to {}", uri);
@@ -141,15 +144,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[tracing::instrument(skip(agent_id, api_token))]
 async fn handle_process(
     agent_id: AgentId,
     api_token: ApiToken,
     process_id: ProcessId,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = PathBuf::from(format!("/tmp/{process_id}"));
+    create_dir_all(&temp_dir).await?;
+    debug!("Temporary directory: {temp_dir:?}");
+
     let api_client = ApiClient::new(api_client::Config {
         base_url: Url::parse("http://localhost:8001")?,
         api_token,
-        temp_dir: PathBuf::from("/tmp"),
+        temp_dir: temp_dir.clone(),
     })?;
 
     let process_api = api_client.process_api();
@@ -157,7 +165,7 @@ async fn handle_process(
     let state_file_path = process_api.download_state(process_id).await?;
     {
         let file = File::open(state_file_path).await?;
-        let out_dir = PathBuf::from("/tmp").join(process_id.to_string());
+        let out_dir = temp_dir.join("state");
         unzip(file, &out_dir).await?;
         debug!("State file extracted to {out_dir:?}");
     }
@@ -174,6 +182,10 @@ async fn handle_process(
                 name: "test".to_owned(),
             },
         )
+        .await?;
+
+    process_api
+        .append_to_log_segment(process_id, segment_id, "Hello, world!".into())
         .await?;
 
     process_api
@@ -202,12 +214,22 @@ fn sanitize_file_path(path: &str) -> PathBuf {
 
 async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = BufReader::new(archive_file).compat();
-    let mut reader = ZipFileReader::new(archive).await?;
-    for index in 0..reader.file().entries().len() {
-        let entry = reader.file().entries().get(index).unwrap();
-        let path = out_dir.join(sanitize_file_path(entry.filename().as_str().unwrap()));
 
-        let entry_is_dir = entry.dir()?;
+    let mut reader = ZipFileReader::new(archive).await?;
+
+    let entries = reader
+        .file()
+        .entries()
+        .iter()
+        .map(|e| (e.filename().clone(), e.unix_permissions()))
+        .enumerate()
+        .collect::<Box<[_]>>();
+
+    for (index, (filename, permissions)) in entries {
+        let filename = sanitize_file_path(filename.as_str()?);
+        let entry_is_dir = filename.ends_with("/");
+        let path = out_dir.join(filename);
+
         if entry_is_dir {
             if !path.exists() {
                 create_dir_all(&path).await?;
@@ -221,17 +243,27 @@ async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std::er
             if !parent.is_dir() {
                 create_dir_all(parent)
                     .await
-                    .expect("Failed to create parent directories");
+                    .map_err(|e| app_error!("Failed to create parent directories: {e}"))?;
             }
+
             let writer = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
                 .await
-                .expect("Failed to create extracted file");
+                .map_err(|e| app_error!("Failed to open file for writing: {e}"))?;
+
             futures_util::io::copy(&mut entry_reader, &mut writer.compat_write())
                 .await
-                .expect("Failed to copy to extracted file");
+                .map_err(|e| app_error!("Failed to copy ZipEntry data: {e}"))?;
+
+            #[cfg(unix)]
+            {
+                if let Some(permissions) = permissions {
+                    let permissions = Permissions::from_mode(permissions as u32);
+                    fs::set_permissions(&path, permissions).await?;
+                }
+            }
         }
     }
 

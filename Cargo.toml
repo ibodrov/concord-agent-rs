@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 async_zip = { version = "0.0.17", features = ["tokio", "deflate"] }
 concord-client = { path = "../concord-client-rs" }
+concord-v2-parser = { path = "../concord-v2-parser" }
 dotenvy = "0.15.7"
 futures-util = "0.3.30"
 http = "1.1.0"
