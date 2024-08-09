@@ -16,6 +16,7 @@ use concord_client::{
     },
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
+use concord_v2_parser::parser::{parse_stream, Input};
 use dotenvy::dotenv;
 use error::AppError;
 use http::Uri;
@@ -168,6 +169,18 @@ async fn handle_process(
         let out_dir = temp_dir.join("state");
         unzip(file, &out_dir).await?;
         debug!("State file extracted to {out_dir:?}");
+        let concord_yml = out_dir.join("concord.yml");
+        if concord_yml.exists() {
+            let concord_yml = fs::read_to_string(concord_yml).await?;
+            debug!("concord.yml: {concord_yml}");
+
+            let mut input = Input::try_from(concord_yml.as_str())
+                .map_err(|e| AppError::new(&format!("Parse error: {e}")))?;
+
+            let docs = parse_stream(&mut input)
+                .map_err(|e| AppError::new(&format!("Parse error: {e}")))?;
+            info!("Docs: {docs:?}");
+        }
     }
 
     process_api
