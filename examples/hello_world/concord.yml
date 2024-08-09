@@ -1,0 +1,6 @@
+configuration:
+  runtime: rs
+flows:
+  default:
+    - log: "Hello, World!"
+  

@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!("Connected to the server");
 
-    let correlation_id_gen = CorrelationIdGenerator::new();
+    let correlation_id_gen = CorrelationIdGenerator::default();
 
     let process_handler = {
         let queue_client = queue_client.clone();
@@ -185,7 +185,7 @@ async fn handle_process(
         .await?;
 
     process_api
-        .append_to_log_segment(process_id, segment_id, "Hello, world!".into())
+        .append_to_log_segment(process_id, segment_id, "Hello, world!\n".into())
         .await?;
 
     process_api
