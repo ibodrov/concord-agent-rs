@@ -2,10 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use concord_client::{
     api_client::{self, ApiClient},
-    model::{
-        AgentId, ApiToken, LogSegmentRequest, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId,
-        ProcessStatus, SegmentCorrelationId,
-    },
+    model::{AgentId, ApiToken, ProcessId, ProcessStatus},
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
 use error::AppError;
@@ -134,36 +131,7 @@ async fn handle_process(
         out_dir
     };
 
-    run(process_id, &work_dir).await?;
-
-    process_api
-        .update_status(process_id, agent_id, ProcessStatus::Running)
-        .await?;
-
-    let segment_id = process_api
-        .create_log_segment(
-            process_id,
-            &LogSegmentRequest {
-                correlation_id: SegmentCorrelationId::new(Uuid::default()),
-                name: "test".to_owned(),
-            },
-        )
-        .await?;
-
-    process_api
-        .append_to_log_segment(process_id, segment_id, "Hello, world!\n".into())
-        .await?;
-
-    process_api
-        .update_log_segment(
-            process_id,
-            segment_id,
-            &LogSegmentUpdateRequest {
-                status: Some(LogSegmentStatus::Ok),
-                ..Default::default()
-            },
-        )
-        .await?;
+    run(process_id, &work_dir, &process_api).await?;
 
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)

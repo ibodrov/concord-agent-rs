@@ -1,11 +1,15 @@
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 use bollard::{
     container::{self, CreateContainerOptions, LogOutput, StartContainerOptions},
     secret::{ContainerWaitResponse, HostConfig, Mount},
     Docker,
 };
-use concord_client::model::ProcessId;
+use bytes::Bytes;
+use concord_client::{
+    api_client::ProcessApiClient,
+    model::{LogSegmentId, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId},
+};
 use futures_util::StreamExt;
 
 use crate::{app_err, app_error, error::AppError};
@@ -16,11 +20,18 @@ impl From<bollard::errors::Error> for AppError {
     }
 }
 
-pub async fn run(process_id: ProcessId, work_dir: &Path) -> Result<(), AppError> {
+pub async fn run<'a>(
+    process_id: ProcessId,
+    work_dir: &'a Path,
+    process_api: &'a ProcessApiClient<'a>,
+) -> Result<(), AppError> {
     // Prepare the runner.json file
-    let runner_json = serde_json::to_string_pretty(
-        &serde_json::json!({ "agentId": "00000000-0000-0000-0000-000000000000" }),
-    )
+    let runner_json = serde_json::to_string_pretty(&serde_json::json!({
+        "agentId": "00000000-0000-0000-0000-000000000000",
+        "api": {
+            "baseUrl": "http://localhost:8001",
+        }
+    }))
     .map_err(|e| app_error!("Failed to serialize runner.json: {:?}", e))?;
 
     let runner_json_path = work_dir.join("runner.json");
@@ -46,7 +57,7 @@ pub async fn run(process_id: ProcessId, work_dir: &Path) -> Result<(), AppError>
 
     let concord_version = "2.15.1-SNAPSHOT"; // Replace with your actual version
     let java_args = format!(
-        "JAVA_ARGS=-DlogLevel=INFO -cp /home/concord/.m2/repository/com/walmartlabs/concord/runtime/v2/concord-runner-v2/{0}/concord-runner-v2-{0}-jar-with-dependencies.jar com.walmartlabs.concord.runtime.v2.runner.Main {1}",
+        "JAVA_ARGS=-cp /home/concord/.m2/repository/com/walmartlabs/concord/runtime/v2/concord-runner-v2/{0}/concord-runner-v2-{0}-jar-with-dependencies.jar com.walmartlabs.concord.runtime.v2.runner.Main {1}",
         concord_version,
         config_path
     );
@@ -62,6 +73,7 @@ pub async fn run(process_id: ProcessId, work_dir: &Path) -> Result<(), AppError>
                 ..Default::default()
             }]),
             auto_remove: Some(true),
+            network_mode: Some("host".to_string()),
             ..Default::default()
         }),
         env: Some(vec![&java_args]),
@@ -92,14 +104,64 @@ pub async fn run(process_id: ProcessId, work_dir: &Path) -> Result<(), AppError>
         }),
     );
 
-    // Process the logs line by line, differentiating between stdout and stderr
+    // Process the logs line by line
     while let Some(log) = logs.next().await {
         match log {
             Ok(LogOutput::StdOut { message }) => {
-                print!("STDOUT: {}", String::from_utf8_lossy(&message));
+                let line = parse_log_line(message)?;
+                match line {
+                    LogLine::Segmented {
+                        msg_length,
+                        segment_id,
+                        status,
+                        warnings,
+                        errors,
+                        msg,
+                    } => {
+                        // TODO retries
+                        // TODO validate msg_length
+                        if msg_length != 0 {
+                            process_api
+                                .append_to_log_segment(process_id, segment_id, Bytes::from(msg))
+                                .await
+                                .map_err(|e| {
+                                    app_error!("Error while appending to a log segment: {e}")
+                                })?;
+                        }
+
+                        process_api
+                            .update_log_segment(
+                                process_id,
+                                segment_id,
+                                &LogSegmentUpdateRequest {
+                                    status: Some(status),
+                                    warnings: Some(warnings),
+                                    errors: Some(errors),
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                app_error!("Error while updating a log segment status: {e}")
+                            })?;
+                    }
+                    LogLine::Regular { msg } => {
+                        // TODO retries
+                        process_api
+                            .append_to_log_segment(
+                                process_id,
+                                LogSegmentId::default(),
+                                Bytes::from(msg),
+                            )
+                            .await
+                            .map_err(|e| {
+                                app_error!("Error while appending to a log segment: {e}")
+                            })?;
+                    }
+                }
             }
             Ok(LogOutput::StdErr { message }) => {
-                eprint!("STDERR: {}", String::from_utf8_lossy(&message));
+                let line = parse_log_line(message)?;
+                todo!("Handle stderr: {:?}", line);
             }
             Err(err) => {
                 eprintln!("Error: {}", err);
@@ -124,4 +186,89 @@ pub async fn run(process_id: ProcessId, work_dir: &Path) -> Result<(), AppError>
     }
 
     app_err!("Container exited unexpectedly")
+}
+
+#[derive(Debug)]
+enum LogLine {
+    Segmented {
+        msg_length: u16,
+        segment_id: LogSegmentId,
+        status: LogSegmentStatus,
+        warnings: u16,
+        errors: u16,
+        msg: Vec<u8>,
+    },
+    Regular {
+        msg: Vec<u8>,
+    },
+}
+
+fn parse_as_utf8_lossy<T: FromStr<Err = impl std::fmt::Display>>(ab: &[u8]) -> Result<T, AppError> {
+    let s = String::from_utf8_lossy(ab);
+    s.parse().map_err(|e| app_error!("Can't parse {s}: {e}"))
+}
+
+fn parse_log_segment_status(ab: &[u8]) -> Result<LogSegmentStatus, AppError> {
+    let s = String::from_utf8_lossy(ab);
+    let i = s
+        .parse::<i32>()
+        .map_err(|e| app_error!("Can't parse {s}: {e}"))?;
+    match i {
+        0 => Ok(LogSegmentStatus::Running),
+        1 => Ok(LogSegmentStatus::Ok),
+        2 => Ok(LogSegmentStatus::Suspended),
+        3 => Ok(LogSegmentStatus::Failed),
+        _ => app_err!("Invalid LogSegmentStatus: {i}"),
+    }
+}
+
+fn parse_log_line(line: Bytes) -> Result<LogLine, AppError> {
+    if line.is_empty() || line[0] != b'|' {
+        return Ok(LogLine::Regular { msg: line.to_vec() });
+    }
+
+    // |msgLength|segmentId|status|warnings|errors|msg
+    let mut parts = line.split(|&b| b == b'|');
+
+    let _ = parts.next(); // skip the first empty part
+
+    let msg_length = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'msg_length' field"))
+        .and_then(parse_as_utf8_lossy)?;
+
+    let segment_id = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'segment_id' field"))
+        .and_then(parse_as_utf8_lossy)
+        .map(LogSegmentId::new)?;
+
+    let status = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'status' field"))
+        .and_then(parse_log_segment_status)?;
+
+    let warnings = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'warnings' field"))
+        .and_then(parse_as_utf8_lossy)?;
+
+    let errors = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'errors' field"))
+        .and_then(parse_as_utf8_lossy)?;
+
+    let msg = parts
+        .next()
+        .ok_or_else(|| app_error!("Invalid log line, expected a 'msg' field"))
+        .map(|v| v.to_vec())?;
+
+    Ok(LogLine::Segmented {
+        msg_length,
+        segment_id,
+        status,
+        warnings,
+        errors,
+        msg,
+    })
 }
