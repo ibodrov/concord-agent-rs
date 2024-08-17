@@ -11,6 +11,7 @@ use concord_client::{
     model::{LogSegmentId, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId},
 };
 use futures_util::StreamExt;
+use tracing::{debug, warn};
 
 use crate::{app_err, app_error, error::AppError};
 
@@ -107,7 +108,7 @@ pub async fn run<'a>(
     // Process the logs line by line
     while let Some(log) = logs.next().await {
         match log {
-            Ok(LogOutput::StdOut { message }) => {
+            Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message }) => {
                 let line = parse_log_line(message)?;
                 match line {
                     LogLine::Segmented {
@@ -159,12 +160,8 @@ pub async fn run<'a>(
                     }
                 }
             }
-            Ok(LogOutput::StdErr { message }) => {
-                let line = parse_log_line(message)?;
-                todo!("Handle stderr: {:?}", line);
-            }
             Err(err) => {
-                eprintln!("Error: {}", err);
+                warn!("Error while parsing container log output: {}", err);
             }
             _ => {}
         }
@@ -175,11 +172,10 @@ pub async fn run<'a>(
     if let Some(result) = wait_stream.next().await {
         match result {
             Ok(ContainerWaitResponse { status_code, .. }) => {
-                println!("Container exited with status code: {}", status_code);
+                debug!(status_code);
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("Error while waiting for container: {:?}", e);
                 return app_err!("Error while waiting for container: {:?}", e);
             }
         }

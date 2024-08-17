@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let correlation_id = correlation_id_gen.next();
                 match queue_client.next_process(correlation_id).await {
                     Ok(ProcessResponse { process_id, .. }) => {
-                        info!("Got process: {process_id}");
+                        info!("Running {process_id}...");
                         if let Err(e) =
                             handle_process(agent_id, api_token.clone(), process_id).await
                         {
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tracing::instrument(skip(agent_id, api_token))]
+#[tracing::instrument(fields(process_id = display(process_id)), skip(agent_id, api_token))]
 async fn handle_process(
     agent_id: AgentId,
     api_token: ApiToken,
@@ -136,6 +136,8 @@ async fn handle_process(
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)
         .await?;
+
+    info!(status = ?ProcessStatus::Finished);
 
     Ok(())
 }
