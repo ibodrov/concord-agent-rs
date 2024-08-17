@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr};
+use std::path::Path;
 
 use bollard::{
     container::{self, CreateContainerOptions, LogOutput, StartContainerOptions},
@@ -8,7 +8,7 @@ use bollard::{
 use bytes::Bytes;
 use concord_client::{
     api_client::ProcessApiClient,
-    model::{AgentId, LogSegmentId, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId},
+    model::{AgentId, LogSegmentId, LogSegmentUpdateRequest, ProcessId},
 };
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -119,55 +119,54 @@ pub async fn run<'a>(
     while let Some(log) = logs.next().await {
         match log {
             Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message }) => {
-                let line = parse_log_line(message)?;
-                match line {
-                    LogLine::Segmented {
-                        msg_length,
-                        segment_id,
-                        status,
-                        warnings,
-                        errors,
-                        msg,
-                    } => {
-                        // TODO retries
-                        // TODO validate msg_length
-                        if msg_length != 0 {
-                            process_api
-                                .append_to_log_segment(process_id, segment_id, Bytes::from(msg))
-                                .await
-                                .map_err(|e| {
-                                    app_error!("Error while appending to a log segment: {e}")
-                                })?;
-                        }
+                let mut segments = Vec::new();
+                let mut invalid_segments = Vec::new();
+                let pos =
+                    segment_header_parser::parse(&message, &mut segments, &mut invalid_segments)?; // TODO handle here
+                if pos != message.len() {
+                    warn!(
+                        "Unparsed data: {:?}",
+                        String::from_utf8_lossy(&message[pos..])
+                    );
+                }
 
+                for segment_header_parser::Segment { header, msg_start } in segments {
+                    if header.length > 0 {
+                        let msg = message[msg_start..msg_start + header.length].to_vec();
                         process_api
-                            .update_log_segment(
-                                process_id,
-                                segment_id,
-                                &LogSegmentUpdateRequest {
-                                    status: Some(status),
-                                    warnings: Some(warnings),
-                                    errors: Some(errors),
-                                },
-                            )
-                            .await
-                            .map_err(|e| {
-                                app_error!("Error while updating a log segment status: {e}")
-                            })?;
-                    }
-                    LogLine::Regular { msg } => {
-                        // TODO retries
-                        process_api
-                            .append_to_log_segment(
-                                process_id,
-                                LogSegmentId::default(),
-                                Bytes::from(msg),
-                            )
+                            .append_to_log_segment(process_id, header.segment_id, Bytes::from(msg))
                             .await
                             .map_err(|e| {
                                 app_error!("Error while appending to a log segment: {e}")
                             })?;
                     }
+
+                    process_api
+                        .update_log_segment(
+                            process_id,
+                            header.segment_id,
+                            &LogSegmentUpdateRequest {
+                                status: Some(header.status),
+                                warnings: Some(header.warn_count),
+                                errors: Some(header.error_count),
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            app_error!("Error while updating a log segment status: {e}")
+                        })?;
+                }
+
+                for pos in invalid_segments {
+                    let msg = message[pos.start..pos.end].to_vec();
+                    process_api
+                        .append_to_log_segment(
+                            process_id,
+                            LogSegmentId::default(),
+                            Bytes::from(msg),
+                        )
+                        .await
+                        .map_err(|e| app_error!("Error while appending to a log segment: {e}"))?;
                 }
             }
             Err(err) => {
@@ -194,87 +193,397 @@ pub async fn run<'a>(
     app_err!("Container exited unexpectedly")
 }
 
-#[derive(Debug)]
-enum LogLine {
-    Segmented {
-        msg_length: u16,
-        segment_id: LogSegmentId,
-        status: LogSegmentStatus,
-        warnings: u16,
-        errors: u16,
-        msg: Vec<u8>,
-    },
-    Regular {
-        msg: Vec<u8>,
-    },
-}
+mod segment_header_parser {
+    use concord_client::model::{LogSegmentId, LogSegmentStatus};
+    use core::str;
+    use std::str::FromStr;
 
-fn parse_as_utf8_lossy<T: FromStr<Err = impl std::fmt::Display>>(ab: &[u8]) -> Result<T, AppError> {
-    let s = String::from_utf8_lossy(ab);
-    s.parse().map_err(|e| app_error!("Can't parse {s}: {e}"))
-}
+    use crate::{app_err, app_error, error::AppError};
 
-fn parse_log_segment_status(ab: &[u8]) -> Result<LogSegmentStatus, AppError> {
-    let s = String::from_utf8_lossy(ab);
-    let i = s
-        .parse::<i32>()
-        .map_err(|e| app_error!("Can't parse {s}: {e}"))?;
-    match i {
-        0 => Ok(LogSegmentStatus::Running),
-        1 => Ok(LogSegmentStatus::Ok),
-        2 => Ok(LogSegmentStatus::Suspended),
-        3 => Ok(LogSegmentStatus::Failed),
-        _ => app_err!("Invalid LogSegmentStatus: {i}"),
-    }
-}
-
-fn parse_log_line(line: Bytes) -> Result<LogLine, AppError> {
-    if line.is_empty() || line[0] != b'|' {
-        return Ok(LogLine::Regular { msg: line.to_vec() });
+    #[derive(Clone, PartialEq)]
+    pub struct LogSegmentHeader {
+        pub length: usize,
+        pub segment_id: LogSegmentId,
+        pub status: LogSegmentStatus,
+        pub warn_count: u16,
+        pub error_count: u16,
     }
 
-    // |msgLength|segmentId|status|warnings|errors|msg
-    let mut parts = line.split(|&b| b == b'|');
+    pub struct Segment {
+        pub header: LogSegmentHeader,
+        pub msg_start: usize,
+    }
 
-    let _ = parts.next(); // skip the first empty part
+    pub struct Position {
+        pub start: usize,
+        pub end: usize,
+    }
 
-    let msg_length = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'msg_length' field"))
-        .and_then(parse_as_utf8_lossy)?;
+    impl Position {
+        pub fn new(start: usize, end: usize) -> Self {
+            Self { start, end }
+        }
+    }
 
-    let segment_id = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'segment_id' field"))
-        .and_then(parse_as_utf8_lossy)
-        .map(LogSegmentId::new)?;
+    enum Field {
+        MsgLength,
+        SegmentId,
+        Status,
+        Warnings,
+        Errors,
+    }
 
-    let status = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'status' field"))
-        .and_then(parse_log_segment_status)?;
+    impl Field {
+        fn next(&self) -> Option<Field> {
+            match self {
+                Field::MsgLength => Some(Field::SegmentId),
+                Field::SegmentId => Some(Field::Status),
+                Field::Status => Some(Field::Warnings),
+                Field::Warnings => Some(Field::Errors),
+                Field::Errors => None,
+            }
+        }
 
-    let warnings = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'warnings' field"))
-        .and_then(parse_as_utf8_lossy)?;
+        fn parse_from_utf8<F, E>(value: &[u8]) -> Result<F, AppError>
+        where
+            F: FromStr<Err = E>,
+            E: std::fmt::Display,
+        {
+            let str = str::from_utf8(value).map_err(|e| app_error!("{}", e))?;
+            str.parse().map_err(|e| app_error!("{}", e))
+        }
 
-    let errors = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'errors' field"))
-        .and_then(parse_as_utf8_lossy)?;
+        pub fn parse_status_from_utf8(value: &[u8]) -> Result<LogSegmentStatus, AppError> {
+            let i = Self::parse_from_utf8(value)?;
+            match i {
+                0 => Ok(LogSegmentStatus::Running),
+                1 => Ok(LogSegmentStatus::Ok),
+                2 => Ok(LogSegmentStatus::Suspended),
+                3 => Ok(LogSegmentStatus::Error),
+                _ => app_err!("Invalid segment_status value: {i}"),
+            }
+        }
 
-    let msg = parts
-        .next()
-        .ok_or_else(|| app_error!("Invalid log line, expected a 'msg' field"))
-        .map(|v| v.to_vec())?;
+        fn process(
+            &self,
+            value: &[u8],
+            mut builder: LogSegmentHeader,
+        ) -> Result<LogSegmentHeader, AppError> {
+            match self {
+                Field::MsgLength => {
+                    builder.length = Self::parse_from_utf8(value)?;
+                }
+                Field::SegmentId => {
+                    builder.segment_id = LogSegmentId::new(Self::parse_from_utf8(value)?);
+                }
+                Field::Status => builder.status = Self::parse_status_from_utf8(value)?,
+                Field::Warnings => {
+                    builder.warn_count = Self::parse_from_utf8(value)?;
+                }
+                Field::Errors => {
+                    builder.error_count = Self::parse_from_utf8(value)?;
+                }
+            }
 
-    Ok(LogLine::Segmented {
-        msg_length,
-        segment_id,
-        status,
-        warnings,
-        errors,
-        msg,
-    })
+            Ok(builder)
+        }
+    }
+
+    pub fn parse(
+        ab: &[u8],
+        segments: &mut Vec<Segment>,
+        invalid_segments: &mut Vec<Position>,
+    ) -> Result<usize, AppError> {
+        enum State {
+            FindHeader,
+            FieldData,
+            EndField,
+        }
+
+        let mut state = State::FindHeader;
+        let mut field = Field::MsgLength;
+        let mut current_header = LogSegmentHeader {
+            length: 0,
+            segment_id: LogSegmentId::default(),
+            status: LogSegmentStatus::Running,
+            warn_count: 0,
+            error_count: 0,
+        };
+
+        let mut mark = None;
+        let mut pos = 0;
+        let mut field_start = 0;
+        let mut continue_parse = true;
+
+        while continue_parse {
+            match state {
+                State::FindHeader => {
+                    if pos >= ab.len() {
+                        continue_parse = false;
+                        continue;
+                    }
+
+                    let ch = ab[pos];
+                    pos += 1;
+
+                    if ch == b'|' {
+                        if let Some(m) = mark {
+                            invalid_segments.push(Position::new(m, pos - 1));
+                        }
+                        mark = Some(pos - 1);
+                        field_start = pos;
+                        state = State::FieldData;
+                    } else if mark.is_none() {
+                        mark = Some(pos - 1);
+                    }
+                }
+                State::FieldData => {
+                    if pos >= ab.len() {
+                        continue_parse = false;
+                        continue;
+                    }
+
+                    let ch = ab[pos];
+                    pos += 1;
+
+                    if ch == b'|' {
+                        state = State::EndField;
+                        continue;
+                    }
+
+                    if !ch.is_ascii_digit() || pos - field_start > 20 {
+                        field = Field::MsgLength;
+                        state = State::FindHeader;
+                        continue;
+                    }
+                }
+                State::EndField => {
+                    let field_value = &ab[field_start..pos - 1];
+                    if field_value.is_empty() {
+                        field = Field::MsgLength;
+                        state = State::FindHeader;
+                        pos -= 1;
+                        continue;
+                    }
+
+                    let field_str = &ab[field_start..pos - 1];
+                    current_header = field.process(field_str, current_header)?;
+
+                    field = match field.next() {
+                        Some(f) => f,
+                        None => {
+                            let header = current_header.clone();
+                            let header_len = header.length;
+                            segments.push(Segment {
+                                header,
+                                msg_start: pos,
+                            });
+                            let actual_length = std::cmp::min(header_len, ab.len() - pos);
+                            pos += actual_length;
+
+                            field = Field::MsgLength;
+                            mark = None;
+                            state = State::FindHeader;
+                            continue;
+                        }
+                    };
+
+                    field_start = pos;
+                    state = State::FieldData;
+                }
+            }
+        }
+
+        if let Some(m) = mark {
+            if matches!(state, State::FindHeader) {
+                invalid_segments.push(Position::new(m, ab.len()));
+                return Ok(ab.len());
+            } else {
+                return Ok(m);
+            }
+        }
+
+        Ok(ab.len())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Helper functions for tests
+        fn msg(ab: &[u8], segment: &Segment) -> String {
+            let to = std::cmp::min(ab.len(), segment.msg_start + segment.header.length);
+            str::from_utf8(&ab[segment.msg_start..to])
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        fn bb(segment_id: i64, msg: &str) -> Vec<u8> {
+            let ab = msg.as_bytes().to_vec();
+            let header = serialize_header(&LogSegmentHeader {
+                segment_id: LogSegmentId::new(segment_id),
+                length: ab.len(),
+                warn_count: 1,
+                error_count: 2,
+                status: LogSegmentStatus::Running,
+            });
+
+            [header, ab].concat()
+        }
+
+        fn serialize_header(header: &LogSegmentHeader) -> Vec<u8> {
+            format!(
+                "|{}|{}|{}|{}|{}|",
+                header.length,
+                header.segment_id,
+                header.status as usize,
+                header.warn_count,
+                header.error_count
+            )
+            .as_bytes()
+            .to_vec()
+        }
+
+        #[test]
+        fn test1() {
+            let log = "hello";
+            let ab = bb(1, log);
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(1, segments.len());
+            assert_eq!(log, msg(&ab, &segments[0]));
+            assert_eq!(0, invalid_segments.len());
+        }
+
+        #[test]
+        fn test1_1() {
+            let ab = [bb(1, "hello-1"), bb(2, "hello-21")].concat();
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(2, segments.len());
+            assert_eq!("hello-1", msg(&ab, &segments[0]));
+            assert_eq!("hello-21", msg(&ab, &segments[1]));
+            assert_eq!(0, invalid_segments.len());
+        }
+
+        #[test]
+        fn test2() {
+            let log = "hello";
+            let ab = log.as_bytes().to_vec();
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(0, segments.len());
+            assert_eq!(1, invalid_segments.len());
+            let i = &invalid_segments[0];
+            assert_eq!(log, String::from_utf8_lossy(&ab[i.start..i.end]));
+        }
+
+        #[test]
+        fn test3() {
+            let log = "hello";
+            let mut ab = vec![b'1', b'2', b'3'];
+            ab.extend(bb(2, log));
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(1, segments.len());
+            assert_eq!("hello", msg(&ab, &segments[0]));
+            assert_eq!(1, invalid_segments.len());
+            let i = &invalid_segments[0];
+            assert_eq!("123", String::from_utf8_lossy(&ab[i.start..i.end]));
+        }
+
+        #[test]
+        fn test4() {
+            let log = "hello";
+            let mut ab = vec![b'1', b'2', b'3'];
+            ab.extend(bb(2, log));
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(1, segments.len());
+            assert_eq!(1, invalid_segments.len());
+            let i = &invalid_segments[0];
+            assert_eq!("123", String::from_utf8_lossy(&ab[i.start..i.end]));
+        }
+
+        #[test]
+        fn test5() {
+            let ab = vec![b'|', b'5', b'|', b'2', b'|', b'1'];
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(0, result);
+            assert_eq!(0, segments.len());
+            assert_eq!(0, invalid_segments.len());
+        }
+
+        #[test]
+        fn test6() {
+            let ab = vec![b'a', b'b', b'c', b'|', b'5', b'|', b'2', b'|', b'1'];
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(3, result);
+            assert_eq!(0, segments.len());
+            assert_eq!(1, invalid_segments.len());
+            let i = &invalid_segments[0];
+            assert_eq!("abc", String::from_utf8_lossy(&ab[i.start..i.end]));
+        }
+
+        #[test]
+        fn test7() {
+            let log = "hello";
+            let full = bb(1, log);
+            let ab = full[0..full.len() - 3].to_vec();
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(1, segments.len());
+            assert_eq!("he", msg(&ab, &segments[0]));
+            assert_eq!(0, invalid_segments.len());
+        }
+
+        #[test]
+        fn test_parse_segment_end_marker() {
+            let log = "|0|552|1|0|0|";
+            let ab = log.as_bytes().to_vec();
+
+            let mut segments = Vec::new();
+            let mut invalid_segments = Vec::new();
+
+            let result = parse(&ab, &mut segments, &mut invalid_segments).unwrap();
+
+            assert_eq!(ab.len(), result);
+            assert_eq!(1, segments.len());
+            let s = &segments[0];
+            assert_eq!(0, s.header.length);
+            assert_eq!(LogSegmentStatus::Ok, s.header.status);
+        }
+    }
 }

@@ -1,6 +1,13 @@
 configuration:
-  runtime: rs
+  runtime: concord-v2
 flows:
   default:
-    - log: "Hello, World!"
-  
+    - task: log
+      in:
+        msg: "Hello, ${item}!"
+      loop:
+        items:
+          - foo
+          - bar
+          - baz
+          - qux
