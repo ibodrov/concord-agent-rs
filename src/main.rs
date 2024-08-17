@@ -6,7 +6,7 @@ use concord_client::{
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
 use error::AppError;
-use runner::run;
+use runner::{ApiConfiguration, RunnerConfiguration};
 use serde_json::json;
 use tokio::{
     fs::{create_dir_all, File},
@@ -114,8 +114,9 @@ async fn handle_process(
     create_dir_all(&temp_dir).await?;
     debug!("Temporary directory: {temp_dir:?}");
 
+    let base_url = "http://localhost:8001".to_string();
     let api_client = ApiClient::new(api_client::Config {
-        base_url: Url::parse("http://localhost:8001")?,
+        base_url: Url::parse(&base_url)?,
         api_token,
         temp_dir: temp_dir.clone(),
     })?;
@@ -131,7 +132,11 @@ async fn handle_process(
         out_dir
     };
 
-    run(process_id, &work_dir, &process_api).await?;
+    let runner_cfg = RunnerConfiguration {
+        agent_id,
+        api: ApiConfiguration { base_url },
+    };
+    runner::run(&runner_cfg, process_id, &work_dir, &process_api).await?;
 
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)

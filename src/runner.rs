@@ -8,9 +8,10 @@ use bollard::{
 use bytes::Bytes;
 use concord_client::{
     api_client::ProcessApiClient,
-    model::{LogSegmentId, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId},
+    model::{AgentId, LogSegmentId, LogSegmentStatus, LogSegmentUpdateRequest, ProcessId},
 };
 use futures_util::StreamExt;
+use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::{app_err, app_error, error::AppError};
@@ -21,19 +22,28 @@ impl From<bollard::errors::Error> for AppError {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct ApiConfiguration {
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunnerConfiguration {
+    #[serde(rename = "agentId")]
+    pub agent_id: AgentId,
+    pub api: ApiConfiguration,
+}
+
 pub async fn run<'a>(
+    runner_cfg: &RunnerConfiguration,
     process_id: ProcessId,
-    work_dir: &'a Path,
+    work_dir: &Path,
     process_api: &'a ProcessApiClient<'a>,
 ) -> Result<(), AppError> {
     // Prepare the runner.json file
-    let runner_json = serde_json::to_string_pretty(&serde_json::json!({
-        "agentId": "00000000-0000-0000-0000-000000000000",
-        "api": {
-            "baseUrl": "http://localhost:8001",
-        }
-    }))
-    .map_err(|e| app_error!("Failed to serialize runner.json: {:?}", e))?;
+    let runner_json = serde_json::to_string(runner_cfg)
+        .map_err(|e| app_error!("Failed to serialize runner.json: {:?}", e))?;
 
     let runner_json_path = work_dir.join("runner.json");
     tokio::fs::write(&runner_json_path, &runner_json)
