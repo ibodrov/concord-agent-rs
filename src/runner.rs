@@ -413,9 +413,7 @@ mod segment_header_parser {
         // Helper functions for tests
         fn msg(ab: &[u8], segment: &Segment) -> String {
             let to = std::cmp::min(ab.len(), segment.msg_start + segment.header.length);
-            str::from_utf8(&ab[segment.msg_start..to])
-                .unwrap_or_default()
-                .to_string()
+            String::from_utf8_lossy(&ab[segment.msg_start..to]).to_string()
         }
 
         fn bb(segment_id: i64, msg: &str) -> Vec<u8> {
