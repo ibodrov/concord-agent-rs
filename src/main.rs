@@ -17,12 +17,13 @@ use url::Url;
 use utils::unzip;
 use uuid::Uuid;
 
+mod controller;
 mod error;
 mod runner;
 mod utils;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), AppError> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt::init();
@@ -30,7 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = AgentId(Uuid::default());
     debug!("Agent ID: {agent_id}");
 
-    let uri = "ws://localhost:8001/websocket".parse::<http::Uri>()?;
+    let uri = "ws://localhost:8001/websocket"
+        .parse::<http::Uri>()
+        .map_err(|e| app_error!("Invalid WEBSOCKET_URL: {e}"))?;
     info!("Connecting to {}", uri);
 
     let api_token = std::env::var("API_TOKEN")
@@ -47,10 +50,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 capabilities: json!({"runtime": "rs"}),
                 ping_interval: Duration::from_secs(10),
             })
-            .await?,
+            .await
+            .map_err(|e| app_error!("Can't connect to the websocket: {e}"))?,
         )
     };
     info!("Connected to the server");
+
+    let mode = std::env::var("MODE").map_err(|_| AppError::new("MODE is not set"))?;
+    match mode.as_str() {
+        "controller" => controller::run().await?,
+        _ => return app_err!("Invalid MODE: {mode}"),
+    };
 
     let correlation_id_gen = CorrelationIdGenerator::default();
 
@@ -98,7 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tokio::try_join!(process_handler, command_handler)?;
+    tokio::try_join!(process_handler, command_handler)
+        .map_err(|e| app_error!("Error waiting for process and command handlers: {e}"))?;
 
     Ok(())
 }
