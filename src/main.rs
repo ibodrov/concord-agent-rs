@@ -18,7 +18,6 @@ use utils::unzip;
 use uuid::Uuid;
 
 mod error;
-mod model;
 mod runner;
 mod utils;
 
