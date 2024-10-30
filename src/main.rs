@@ -15,7 +15,6 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use url::Url;
 use utils::unzip;
-use uuid::Uuid;
 
 mod controller;
 mod error;
@@ -28,7 +27,7 @@ async fn main() -> Result<(), AppError> {
 
     tracing_subscriber::fmt::init();
 
-    let agent_id = AgentId(Uuid::default());
+    let agent_id = AgentId::default();
     debug!("Agent ID: {agent_id}");
 
     let uri = "ws://localhost:8001/websocket"
