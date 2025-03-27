@@ -152,6 +152,7 @@ async fn handle_process(
 
     let process_api = api_client.process_api();
 
+    // download state
     let state_file_path = process_api.download_state(process_id).await?;
     let work_dir = {
         let file = File::open(state_file_path).await?;
@@ -161,12 +162,16 @@ async fn handle_process(
         out_dir
     };
 
+    // execute process
     let runner_cfg = RunnerConfiguration {
         agent_id,
         api: ApiConfiguration { base_url },
     };
     runner::run(&runner_cfg, process_id, &work_dir, &process_api).await?;
 
+    // TODO upload attachments
+
+    // mark as FINISHED
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)
         .await?;
