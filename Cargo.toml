@@ -4,24 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async_zip = { version = "0.0.17", features = ["tokio", "deflate"] }
-bollard = "0.17.0"
-bytes = "1.7.1"
+async_zip = { version = "0", features = ["tokio", "deflate"] }
+bollard = "0"
+bytes = "1"
 concord-client = { path = "../concord-client-rs" }
-dotenvy = "0.15.7"
-futures-util = "0.3.30"
-http = "1.1.0"
-k8s-openapi = { version = "0.22.0", features = ["latest"]}
-kube = { version = "0.93.1" }
-serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.120"
-tokio = { version = "1.39.1", features = ["full"] }
-tokio-tungstenite = "0.23.1"
-tokio-util = { version = "0.7.11", features = ["compat"] }
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
-url = "2.5.2"
-uuid = { version = "1.10.0", features = ["serde"] }
+dotenvy = "0"
+futures-util = "0"
+http = "1"
+k8s-openapi = { version = "0", features = ["latest"]}
+kube = { version = "0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0"
+tokio-util = { version = "0", features = ["compat"] }
+tracing = "0"
+tracing-subscriber = "0"
+url = "2"
+uuid = { version = "1", features = ["serde"] }
 
 [profile.release]
 lto = "fat"
