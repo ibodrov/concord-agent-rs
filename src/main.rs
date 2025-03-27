@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use concord_client::{
     api_client::{self, ApiClient},
-    model::{AgentId, ApiToken, ProcessId, ProcessStatus},
+    model::{AgentId, ApiToken, ProcessId, ProcessStatus, SessionToken},
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
 use error::AppError;
@@ -58,39 +58,64 @@ async fn main() -> Result<(), AppError> {
     let mode = std::env::var("MODE").map_err(|_| AppError::new("MODE is not set"))?;
     match mode.as_str() {
         "controller" => controller::run().await?,
+        "standalone" => {}
         _ => return app_err!("Invalid MODE: {mode}"),
     };
 
     let correlation_id_gen = CorrelationIdGenerator::default();
 
-    let process_handler = {
-        let queue_client = queue_client.clone();
-        let correlation_id_gen = correlation_id_gen.clone();
-        tokio::spawn(async move {
-            loop {
-                debug!("Waiting for next process...");
-                let correlation_id = correlation_id_gen.next();
-                match queue_client.next_process(correlation_id).await {
-                    Ok(ProcessResponse { process_id, .. }) => {
-                        info!("Running {process_id}...");
-                        if let Err(e) =
-                            handle_process(agent_id, api_token.clone(), process_id).await
-                        {
-                            error!("{e}");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error while getting next process: {e}");
-                        warn!("Retrying in 5 seconds...");
-                        sleep(Duration::from_secs(5)).await;
+    let process_handler =
+        spawn_process_handler(queue_client.clone(), correlation_id_gen.clone(), agent_id);
+    let command_handler = spawn_command_handler(queue_client, correlation_id_gen);
+
+    tokio::select! {
+        _ = process_handler => {
+            error!("Process handler exited unexpectedly");
+        }
+        _ = command_handler => {
+            error!("Command handler exited unexpectedly");
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_process_handler(
+    queue_client: Arc<QueueClient>,
+    correlation_id_gen: CorrelationIdGenerator,
+    agent_id: AgentId,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            debug!("Waiting for next process...");
+            let correlation_id = correlation_id_gen.next();
+            match queue_client.next_process(correlation_id).await {
+                Ok(ProcessResponse {
+                    process_id,
+                    session_token,
+                    ..
+                }) => {
+                    info!("Running {process_id}...");
+                    if let Err(e) = handle_process(agent_id, session_token, process_id).await {
+                        error!("{e}");
+                        continue;
                     }
                 }
+                Err(e) => {
+                    warn!("Error while getting next process: {e}");
+                    warn!("Retrying in 5 seconds...");
+                    sleep(Duration::from_secs(5)).await;
+                }
             }
-        })
-    };
+        }
+    })
+}
 
-    let command_handler = tokio::spawn(async move {
+fn spawn_command_handler(
+    queue_client: Arc<QueueClient>,
+    correlation_id_gen: CorrelationIdGenerator,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             debug!("Waiting for next command...");
             let correlation_id = correlation_id_gen.next();
@@ -105,18 +130,13 @@ async fn main() -> Result<(), AppError> {
                 }
             }
         }
-    });
-
-    tokio::try_join!(process_handler, command_handler)
-        .map_err(|e| app_error!("Error waiting for process and command handlers: {e}"))?;
-
-    Ok(())
+    })
 }
 
-#[tracing::instrument(fields(process_id = display(process_id)), skip(agent_id, api_token))]
+#[tracing::instrument(fields(process_id = display(process_id)), skip(agent_id, session_token))]
 async fn handle_process(
     agent_id: AgentId,
-    api_token: ApiToken,
+    session_token: SessionToken,
     process_id: ProcessId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = PathBuf::from(format!("/tmp/{process_id}"));
@@ -126,7 +146,7 @@ async fn handle_process(
     let base_url = "http://localhost:8001".to_string();
     let api_client = ApiClient::new(api_client::Config {
         base_url: Url::parse(&base_url)?,
-        api_token,
+        session_token,
         temp_dir: temp_dir.clone(),
     })?;
 

@@ -65,13 +65,7 @@ pub async fn run<'a>(
     let host_path = work_dir.to_string_lossy();
     let container_path = "/work";
     let config_path = "/work/runner.json";
-
-    let concord_version = "2.15.1-SNAPSHOT"; // Replace with your actual version
-    let java_args = format!(
-        "JAVA_ARGS=-cp /home/concord/.m2/repository/com/walmartlabs/concord/runtime/v2/concord-runner-v2/{0}/concord-runner-v2-{0}-jar-with-dependencies.jar com.walmartlabs.concord.runtime.v2.runner.Main {1}",
-        concord_version,
-        config_path
-    );
+    let env = format!("RUNNER_ARGS={config_path}");
 
     let config = container::Config {
         image: Some(image),
@@ -87,7 +81,7 @@ pub async fn run<'a>(
             network_mode: Some("host".to_string()),
             ..Default::default()
         }),
-        env: Some(vec![&java_args]),
+        env: Some(vec![&env]),
         working_dir: Some(container_path),
         ..Default::default()
     };
@@ -122,7 +116,7 @@ pub async fn run<'a>(
                 let mut segments = Vec::new();
                 let mut invalid_segments = Vec::new();
                 let pos =
-                    segment_header_parser::parse(&message, &mut segments, &mut invalid_segments)?; // TODO handle here
+                    segment_header_parser::parse(&message, &mut segments, &mut invalid_segments)?; // TODO handle error here instead of bubbling up
                 if pos != message.len() {
                     warn!(
                         "Unparsed data: {:?}",

@@ -10,5 +10,5 @@ pub async fn run() -> Result<(), AppError> {
         .await?;
     info!("Connected to Kubernetes API...");
 
-    Ok(())
+    todo!("rest of the owl")
 }
