@@ -39,6 +39,17 @@ async fn main() -> Result<(), anyhow::Error> {
         .context("API_TOKEN is not set")
         .map(ApiToken::new)?;
 
+    let mode = std::env::var("MODE").context("MODE is not set")?;
+    match mode.as_str() {
+        "controller" => controller::run().await?,
+        "standalone" => {}
+        _ => anyhow::bail!("Invalid MODE: {mode}"),
+    };
+
+    let max_concurrency = std::env::var("MAX_CONCURRENCY")
+        .map_or(Ok(10), |s| s.parse())
+        .context("Invalid MAX_CONCURRENCY value")?;
+
     let queue_client = {
         let api_token = api_token.clone();
         Arc::new(
@@ -55,40 +66,29 @@ async fn main() -> Result<(), anyhow::Error> {
     };
     info!("Connected to the server");
 
-    let mode = std::env::var("MODE").context("MODE is not set")?;
-    match mode.as_str() {
-        "controller" => controller::run().await?,
-        "standalone" => {}
-        _ => anyhow::bail!("Invalid MODE: {mode}"),
-    };
-
     let correlation_id_gen = CorrelationIdGenerator::default();
 
-    let max_concurrency = 10;
-
     let process_handlers: Vec<_> = (0..max_concurrency)
-        .map(|i| {
+        .map(|handler_id| {
             spawn_process_handler(
-                i,
+                handler_id,
                 queue_client.clone(),
                 correlation_id_gen.clone(),
                 agent_id,
             )
         })
         .collect();
+
     let command_handler = spawn_command_handler(queue_client.clone(), correlation_id_gen.clone());
 
     tokio::select! {
-        result = async {
+        _ = async {
             for handler in process_handlers {
                 handler.await?;
             }
             Ok::<_, tokio::task::JoinError>(())
         } => {
-            match result {
-                Ok(_) => error!("A process handler completed unexpectedly"),
-                Err(e) => error!("Process handler failed: {}", e),
-            }
+            error!("Process handler completed unexpectedly")
         }
         _ = command_handler => {
             error!("Command handler exited unexpectedly");
