@@ -124,7 +124,7 @@ fn spawn_process_handler(
                 Err(e) => {
                     warn!(
                         handler_id,
-                        "Error while getting next process: {e}. Retrying in 5 seconds..."
+                        "Failed to get next process: {e}. Retrying in 5 seconds..."
                     );
                     sleep(Duration::from_secs(5)).await;
                 }
@@ -146,8 +146,7 @@ fn spawn_command_handler(
                     info!("Got command: {cmd:?}");
                 }
                 Err(e) => {
-                    warn!("Error while getting next command: {e}");
-                    warn!("Retrying in 5 seconds...");
+                    warn!("Failed to get next command: {e}. Retrying in 5 seconds...");
                     sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -175,7 +174,10 @@ async fn handle_process(
     let process_api = api_client.process_api();
 
     // download state
-    let state_file_path = process_api.download_state(process_id).await?;
+    let state_file_path = process_api
+        .download_state(process_id)
+        .await
+        .context("Failed to download the process state")?;
     let work_dir = {
         let file = File::open(state_file_path).await?;
         let out_dir = temp_dir.join("state");
@@ -196,7 +198,8 @@ async fn handle_process(
     // mark as FINISHED
     process_api
         .update_status(process_id, agent_id, ProcessStatus::Finished)
-        .await?;
+        .await
+        .context("Failed to update process status to FINISHED")?;
 
     info!(status = ?ProcessStatus::Finished);
 
