@@ -1,9 +1,10 @@
 use std::path::Path;
 
+use anyhow::Context;
 use bollard::{
+    Docker,
     container::{self, CreateContainerOptions, LogOutput, StartContainerOptions},
     secret::{ContainerWaitResponse, HostConfig, Mount},
-    Docker,
 };
 use bytes::Bytes;
 use concord_client::{
@@ -13,14 +14,6 @@ use concord_client::{
 use futures_util::StreamExt;
 use serde::Serialize;
 use tracing::{debug, warn};
-
-use crate::{app_err, app_error, error::AppError};
-
-impl From<bollard::errors::Error> for AppError {
-    fn from(err: bollard::errors::Error) -> Self {
-        AppError::new(&format!("{}", err))
-    }
-}
 
 #[derive(Debug, Serialize)]
 pub struct ApiConfiguration {
@@ -40,22 +33,22 @@ pub async fn run<'a>(
     process_id: ProcessId,
     work_dir: &Path,
     process_api: &'a ProcessApiClient<'a>,
-) -> Result<(), AppError> {
+) -> anyhow::Result<()> {
     // Prepare the runner.json file
-    let runner_json = serde_json::to_string(runner_cfg)
-        .map_err(|e| app_error!("Failed to serialize runner.json: {:?}", e))?;
+    let runner_json =
+        serde_json::to_string(runner_cfg).context("Failed to serialize runner.json")?;
 
     let runner_json_path = work_dir.join("runner.json");
     tokio::fs::write(&runner_json_path, &runner_json)
         .await
-        .map_err(|e| app_error!("Failed to write runner.json: {:?}", e))?;
+        .context("Failed to write runner.json")?;
 
     // Prepare the _instanceId file
     let instance_id = format!("{}", process_id);
     let instance_id_path = work_dir.join("_instanceId");
     tokio::fs::write(&instance_id_path, &instance_id)
         .await
-        .map_err(|e| app_error!("Failed to write _instanceId: {:?}", e))?;
+        .context("Failed to write _instanceId file")?;
 
     // Connect to Docker
     let docker = Docker::connect_with_local_defaults()?;
@@ -130,9 +123,7 @@ pub async fn run<'a>(
                         process_api
                             .append_to_log_segment(process_id, header.segment_id, Bytes::from(msg))
                             .await
-                            .map_err(|e| {
-                                app_error!("Error while appending to a log segment: {e}")
-                            })?;
+                            .context("Error while appending to a log segment")?;
                     }
 
                     process_api
@@ -146,9 +137,7 @@ pub async fn run<'a>(
                             },
                         )
                         .await
-                        .map_err(|e| {
-                            app_error!("Error while updating a log segment status: {e}")
-                        })?;
+                        .context("Error while updating a log segment status")?;
                 }
 
                 for pos in invalid_segments {
@@ -160,7 +149,7 @@ pub async fn run<'a>(
                             Bytes::from(msg),
                         )
                         .await
-                        .map_err(|e| app_error!("Error while appending to a log segment: {e}"))?;
+                        .context("Error while appending to a log segment")?;
                 }
             }
             Err(err) => {
@@ -179,20 +168,17 @@ pub async fn run<'a>(
                 return Ok(());
             }
             Err(e) => {
-                return app_err!("Error while waiting for container: {:?}", e);
+                anyhow::bail!("Error while waiting for container: {:?}", e);
             }
         }
     }
 
-    app_err!("Container exited unexpectedly")
+    anyhow::bail!("Container exited unexpectedly")
 }
 
 mod segment_header_parser {
     use concord_client::model::{LogSegmentId, LogSegmentStatus};
     use core::str;
-    use std::str::FromStr;
-
-    use crate::{app_err, app_error, error::AppError};
 
     #[derive(Clone, PartialEq)]
     pub struct LogSegmentHeader {
@@ -238,23 +224,15 @@ mod segment_header_parser {
             }
         }
 
-        fn parse_from_utf8<F, E>(value: &[u8]) -> Result<F, AppError>
-        where
-            F: FromStr<Err = E>,
-            E: std::fmt::Display,
-        {
-            let str = str::from_utf8(value).map_err(|e| app_error!("{}", e))?;
-            str.parse().map_err(|e| app_error!("{}", e))
-        }
-
-        pub fn parse_status_from_utf8(value: &[u8]) -> Result<LogSegmentStatus, AppError> {
-            let i = Self::parse_from_utf8(value)?;
+        pub fn parse_status_from_utf8(value: &[u8]) -> anyhow::Result<LogSegmentStatus> {
+            let s = str::from_utf8(value)?;
+            let i = s.parse()?;
             match i {
                 0 => Ok(LogSegmentStatus::Running),
                 1 => Ok(LogSegmentStatus::Ok),
                 2 => Ok(LogSegmentStatus::Suspended),
                 3 => Ok(LogSegmentStatus::Error),
-                _ => app_err!("Invalid segment_status value: {i}"),
+                _ => anyhow::bail!("Invalid segment_status value: {i}"),
             }
         }
 
@@ -262,20 +240,20 @@ mod segment_header_parser {
             &self,
             value: &[u8],
             mut builder: LogSegmentHeader,
-        ) -> Result<LogSegmentHeader, AppError> {
+        ) -> anyhow::Result<LogSegmentHeader> {
             match self {
                 Field::MsgLength => {
-                    builder.length = Self::parse_from_utf8(value)?;
+                    builder.length = str::from_utf8(value)?.parse()?;
                 }
                 Field::SegmentId => {
-                    builder.segment_id = LogSegmentId::new(Self::parse_from_utf8(value)?);
+                    builder.segment_id = LogSegmentId::new(str::from_utf8(value)?.parse()?);
                 }
                 Field::Status => builder.status = Self::parse_status_from_utf8(value)?,
                 Field::Warnings => {
-                    builder.warn_count = Self::parse_from_utf8(value)?;
+                    builder.warn_count = str::from_utf8(value)?.parse()?;
                 }
                 Field::Errors => {
-                    builder.error_count = Self::parse_from_utf8(value)?;
+                    builder.error_count = str::from_utf8(value)?.parse()?;
                 }
             }
 
@@ -287,7 +265,7 @@ mod segment_header_parser {
         ab: &[u8],
         segments: &mut Vec<Segment>,
         invalid_segments: &mut Vec<Position>,
-    ) -> Result<usize, AppError> {
+    ) -> anyhow::Result<usize> {
         enum State {
             FindHeader,
             FieldData,

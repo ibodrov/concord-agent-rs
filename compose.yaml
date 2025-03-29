@@ -1,0 +1,15 @@
+services:
+  concord-db:
+    image: "library/postgres:10"
+    environment:
+      POSTGRES_PASSWORD: "q1"
+  concord-server:
+    image: "walmartlabs/concord-server"
+    depends_on:
+      - "concord-db"
+    ports:
+      - "8001:8001"
+    volumes:
+      - "./concord.conf:/concord.conf:ro"
+    environment:
+      CONCORD_CFG_FILE: "/concord.conf"

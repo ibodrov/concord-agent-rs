@@ -1,15 +1,15 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use concord_client::{
     api_client::{self, ApiClient},
     model::{AgentId, ApiToken, ProcessId, ProcessStatus, SessionToken},
     queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
 };
-use error::AppError;
 use runner::{ApiConfiguration, RunnerConfiguration};
 use serde_json::json;
 use tokio::{
-    fs::{create_dir_all, File},
+    fs::{File, create_dir_all},
     time::sleep,
 };
 use tracing::{debug, error, info, warn};
@@ -17,12 +17,11 @@ use url::Url;
 use utils::unzip;
 
 mod controller;
-mod error;
 mod runner;
 mod utils;
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() -> Result<(), anyhow::Error> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt::init();
@@ -32,11 +31,12 @@ async fn main() -> Result<(), AppError> {
 
     let uri = "ws://localhost:8001/websocket"
         .parse::<http::Uri>()
-        .map_err(|e| app_error!("Invalid WEBSOCKET_URL: {e}"))?;
+        .context("Invalid WEBSOCKET_URL")?;
+
     info!("Connecting to {}", uri);
 
     let api_token = std::env::var("API_TOKEN")
-        .map_err(|_| AppError::new("API_TOKEN is not set"))
+        .context("API_TOKEN is not set")
         .map(ApiToken::new)?;
 
     let queue_client = {
@@ -50,27 +50,45 @@ async fn main() -> Result<(), AppError> {
                 ping_interval: Duration::from_secs(10),
             })
             .await
-            .map_err(|e| app_error!("Can't connect to the websocket: {e}"))?,
+            .context("Can't connect to the websocket")?,
         )
     };
     info!("Connected to the server");
 
-    let mode = std::env::var("MODE").map_err(|_| AppError::new("MODE is not set"))?;
+    let mode = std::env::var("MODE").context("MODE is not set")?;
     match mode.as_str() {
         "controller" => controller::run().await?,
         "standalone" => {}
-        _ => return app_err!("Invalid MODE: {mode}"),
+        _ => anyhow::bail!("Invalid MODE: {mode}"),
     };
 
     let correlation_id_gen = CorrelationIdGenerator::default();
 
-    let process_handler =
-        spawn_process_handler(queue_client.clone(), correlation_id_gen.clone(), agent_id);
-    let command_handler = spawn_command_handler(queue_client, correlation_id_gen);
+    let max_concurrency = 10;
+
+    let process_handlers: Vec<_> = (0..max_concurrency)
+        .map(|i| {
+            spawn_process_handler(
+                i,
+                queue_client.clone(),
+                correlation_id_gen.clone(),
+                agent_id,
+            )
+        })
+        .collect();
+    let command_handler = spawn_command_handler(queue_client.clone(), correlation_id_gen.clone());
 
     tokio::select! {
-        _ = process_handler => {
-            error!("Process handler exited unexpectedly");
+        result = async {
+            for handler in process_handlers {
+                handler.await?;
+            }
+            Ok::<_, tokio::task::JoinError>(())
+        } => {
+            match result {
+                Ok(_) => error!("A process handler completed unexpectedly"),
+                Err(e) => error!("Process handler failed: {}", e),
+            }
         }
         _ = command_handler => {
             error!("Command handler exited unexpectedly");
@@ -81,13 +99,14 @@ async fn main() -> Result<(), AppError> {
 }
 
 fn spawn_process_handler(
+    handler_id: usize,
     queue_client: Arc<QueueClient>,
     correlation_id_gen: CorrelationIdGenerator,
     agent_id: AgentId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            debug!("Waiting for next process...");
+            debug!(handler_id, "Waiting for next process...");
             let correlation_id = correlation_id_gen.next();
             match queue_client.next_process(correlation_id).await {
                 Ok(ProcessResponse {
@@ -95,15 +114,18 @@ fn spawn_process_handler(
                     session_token,
                     ..
                 }) => {
-                    info!("Running {process_id}...");
+                    info!(handler_id, "Running {process_id}...");
                     if let Err(e) = handle_process(agent_id, session_token, process_id).await {
-                        error!("{e}");
+                        error!("Process failed: {e}. Continuing in 5 seconds...");
+                        sleep(Duration::from_secs(5)).await;
                         continue;
                     }
                 }
                 Err(e) => {
-                    warn!("Error while getting next process: {e}");
-                    warn!("Retrying in 5 seconds...");
+                    warn!(
+                        handler_id,
+                        "Error while getting next process: {e}. Retrying in 5 seconds..."
+                    );
                     sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -138,7 +160,7 @@ async fn handle_process(
     agent_id: AgentId,
     session_token: SessionToken,
     process_id: ProcessId,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     let temp_dir = PathBuf::from(format!("/tmp/{process_id}"));
     create_dir_all(&temp_dir).await?;
     debug!("Temporary directory: {temp_dir:?}");

@@ -4,13 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, anyhow};
 use tokio::{
-    fs::{self, create_dir_all, File, OpenOptions},
+    fs::{self, File, OpenOptions, create_dir_all},
     io::BufReader,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-use crate::app_error;
 
 fn sanitize_file_path(path: &str) -> PathBuf {
     path.replace('\\', "/")
@@ -18,7 +17,7 @@ fn sanitize_file_path(path: &str) -> PathBuf {
         .collect()
 }
 
-pub async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn unzip(archive_file: File, out_dir: &Path) -> anyhow::Result<()> {
     let archive = BufReader::new(archive_file).compat();
 
     let mut reader = async_zip::tokio::read::seek::ZipFileReader::new(archive).await?;
@@ -43,13 +42,13 @@ pub async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std
         } else {
             let mut entry_reader = reader.reader_without_entry(index).await?;
 
-            let parent = path.parent().ok_or_else(|| {
-                app_error!("Failed to get parent path of the target file: {path:?}")
-            })?;
+            let parent = path.parent().ok_or(anyhow!(
+                "Failed to get parent path of the target file: {path:?}"
+            ))?;
             if !parent.is_dir() {
                 create_dir_all(parent)
                     .await
-                    .map_err(|e| app_error!("Failed to create parent directories: {e}"))?;
+                    .context("Failed to create parent directories")?;
             }
 
             let writer = OpenOptions::new()
@@ -57,11 +56,11 @@ pub async fn unzip(archive_file: File, out_dir: &Path) -> Result<(), Box<dyn std
                 .create_new(true)
                 .open(&path)
                 .await
-                .map_err(|e| app_error!("Failed to open file for writing: {e}"))?;
+                .context("Failed to open file for writing")?;
 
             futures_util::io::copy(&mut entry_reader, &mut writer.compat_write())
                 .await
-                .map_err(|e| app_error!("Failed to copy ZipEntry data: {e}"))?;
+                .context("Failed to copy ZipEntry data")?;
 
             #[cfg(unix)]
             {

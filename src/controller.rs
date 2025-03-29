@@ -1,14 +1,12 @@
-use futures_util::TryFutureExt;
+use anyhow::Context;
+
 use kube::Client;
 use tracing::info;
 
-use crate::{app_error, error::AppError};
-
-pub async fn run() -> Result<(), AppError> {
+pub async fn run() -> anyhow::Result<()> {
     Client::try_default()
-        .map_err(|e| app_error!("Can't connect to K8s: {e}"))
-        .await?;
+        .await
+        .context("Can't connect to Kubernetes API")?;
     info!("Connected to Kubernetes API...");
-
     todo!("rest of the owl")
 }
