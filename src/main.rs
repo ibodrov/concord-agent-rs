@@ -1,18 +1,19 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use concord_client::{
     api_client::{self, ApiClient},
     model::{AgentId, ApiToken, ProcessId, ProcessStatus, SessionToken},
-    queue_client::{self, CorrelationIdGenerator, ProcessResponse, QueueClient},
+    queue_client::{self, ProcessResponse, QueueClient},
 };
 use runner::{ApiConfiguration, RunnerConfiguration};
 use serde_json::json;
 use tokio::{
     fs::{File, create_dir_all},
-    time::sleep,
+    signal,
 };
-use tracing::{debug, error, info, warn};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{debug, info, warn};
 use url::Url;
 use utils::unzip;
 
@@ -41,117 +42,90 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mode = std::env::var("MODE").context("MODE is not set")?;
     match mode.as_str() {
-        "controller" => controller::run().await?,
-        "standalone" => {}
+        "controller" => {
+            controller::run().await?;
+            // doesn't automatically reconnects
+        }
+        "standalone" => {
+            // automatically reconnects
+        }
         _ => anyhow::bail!("Invalid MODE: {mode}"),
     };
 
-    let max_concurrency = std::env::var("MAX_CONCURRENCY")
+    let _max_concurrency = std::env::var("MAX_CONCURRENCY") // TODO
         .map_or(Ok(10), |s| s.parse())
         .context("Invalid MAX_CONCURRENCY value")?;
 
-    let queue_client = {
-        let api_token = api_token.clone();
-        Arc::new(
-            QueueClient::connect(queue_client::Config {
-                agent_id,
-                uri,
-                api_token,
-                capabilities: json!({"runtime": "rs"}),
-                ping_interval: Duration::from_secs(10),
-            })
-            .await
-            .context("Can't connect to the websocket")?,
-        )
-    };
-    info!("Connected to the server");
+    let cancellation_token = CancellationToken::new();
 
-    let correlation_id_gen = CorrelationIdGenerator::default();
-
-    let process_handlers: Vec<_> = (0..max_concurrency)
-        .map(|handler_id| {
-            spawn_process_handler(
-                handler_id,
-                queue_client.clone(),
-                correlation_id_gen.clone(),
-                agent_id,
-            )
-        })
-        .collect();
-
-    let command_handler = spawn_command_handler(queue_client.clone(), correlation_id_gen.clone());
-
-    tokio::select! {
-        _ = async {
-            for handler in process_handlers {
-                handler.await?;
+    let token = cancellation_token.clone();
+    tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(_) => {
+                debug!("Received a shutdown signal...");
+                token.cancel();
             }
-            Ok::<_, tokio::task::JoinError>(())
-        } => {
-            error!("Process handler completed unexpectedly")
+            Err(_) => warn!("Unable to listen for shutdown signal."),
         }
-        _ = command_handler => {
-            error!("Command handler exited unexpectedly");
+    });
+
+    let tracker = TaskTracker::new();
+
+    loop {
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+
+        let queue_client_config = queue_client::Config {
+            agent_id,
+            uri: uri.clone(),
+            api_token: api_token.clone(),
+            capabilities: json!({}),
+            ping_interval: Duration::from_secs(10),
+        };
+
+        match QueueClient::connect(queue_client_config).await {
+            Ok(queue_client) => {
+                info!("Connected");
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => break,
+                    cmd = queue_client.next_command() => {
+                        match cmd {
+                            Ok(_) => {
+                                warn!("TODO Actually handle commands");
+                            },
+                            Err(e) => {
+                                warn!("Failed to receive a command: {e}")
+                            }
+                        }
+                    },
+                    proc = queue_client.next_process() => {
+                        match proc {
+                            Ok(ProcessResponse { session_token, process_id, .. }) => {
+                                tracker.spawn(async move { handle_process(agent_id, session_token, process_id).await });
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive a process: {e}")
+                            },
+                        }
+
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Queue client error: {e}. Reconnecting in 5 seconds...");
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                }
+            }
         }
     }
 
+    debug!("Shutting down...");
+    tracker.close();
+    tracker.wait().await;
     Ok(())
-}
-
-fn spawn_process_handler(
-    handler_id: usize,
-    queue_client: Arc<QueueClient>,
-    correlation_id_gen: CorrelationIdGenerator,
-    agent_id: AgentId,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            debug!(handler_id, "Waiting for next process...");
-            let correlation_id = correlation_id_gen.next();
-            match queue_client.next_process(correlation_id).await {
-                Ok(ProcessResponse {
-                    process_id,
-                    session_token,
-                    ..
-                }) => {
-                    info!(handler_id, "Running {process_id}...");
-                    if let Err(e) = handle_process(agent_id, session_token, process_id).await {
-                        error!("Process failed: {e}. Continuing in 5 seconds...");
-                        sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        handler_id,
-                        "Failed to get next process: {e}. Retrying in 5 seconds..."
-                    );
-                    sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    })
-}
-
-fn spawn_command_handler(
-    queue_client: Arc<QueueClient>,
-    correlation_id_gen: CorrelationIdGenerator,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            debug!("Waiting for next command...");
-            let correlation_id = correlation_id_gen.next();
-            match queue_client.next_command(correlation_id).await {
-                Ok(cmd) => {
-                    info!("Got command: {cmd:?}");
-                }
-                Err(e) => {
-                    warn!("Failed to get next command: {e}. Retrying in 5 seconds...");
-                    sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    })
 }
 
 #[tracing::instrument(fields(process_id = display(process_id)), skip(agent_id, session_token))]
