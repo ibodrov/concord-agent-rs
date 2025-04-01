@@ -11,5 +11,5 @@ flows:
           - bar
           - baz
           - qux
-    - ${sleep.ms(5000)}
+    - ${sleep.ms(30000)}
     - log: Bye!
