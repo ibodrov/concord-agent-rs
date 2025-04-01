@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use concord_client::{
@@ -52,9 +52,11 @@ async fn main() -> Result<(), anyhow::Error> {
         _ => anyhow::bail!("Invalid MODE: {mode}"),
     };
 
-    let _max_concurrency = std::env::var("MAX_CONCURRENCY") // TODO
+    let max_concurrency = std::env::var("MAX_CONCURRENCY") // TODO
         .map_or(Ok(10), |s| s.parse())
         .context("Invalid MAX_CONCURRENCY value")?;
+
+    info!("Using MAX_CONCURRENCY={max_concurrency}");
 
     let cancellation_token = CancellationToken::new();
 
@@ -69,48 +71,90 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
-    let tracker = TaskTracker::new();
+    let queue_client_config = queue_client::Config {
+        agent_id,
+        uri: uri.clone(),
+        api_token: api_token.clone(),
+        capabilities: json!({}),
+        ping_interval: Duration::from_secs(10),
+    };
+
+    let process_tracker = TaskTracker::new();
 
     loop {
         if cancellation_token.is_cancelled() {
             break;
         }
 
-        let queue_client_config = queue_client::Config {
-            agent_id,
-            uri: uri.clone(),
-            api_token: api_token.clone(),
-            capabilities: json!({}),
-            ping_interval: Duration::from_secs(10),
-        };
-
-        match QueueClient::connect(queue_client_config).await {
+        match QueueClient::connect(&queue_client_config).await {
             Ok(queue_client) => {
                 info!("Connected");
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => break,
-                    cmd = queue_client.next_command() => {
-                        match cmd {
-                            Ok(_) => {
-                                warn!("TODO Actually handle commands");
-                            },
-                            Err(e) => {
-                                warn!("Failed to receive a command: {e}")
-                            }
-                        }
-                    },
-                    proc = queue_client.next_process() => {
-                        match proc {
-                            Ok(ProcessResponse { session_token, process_id, .. }) => {
-                                tracker.spawn(async move { handle_process(agent_id, session_token, process_id).await });
-                            }
-                            Err(e) => {
-                                warn!("Failed to receive a process: {e}")
-                            },
+
+                let queue_client = Arc::new(queue_client);
+
+                let client = queue_client.clone();
+                let token = cancellation_token.clone();
+                let command_task = tokio::spawn(async move {
+                    loop {
+                        if token.is_cancelled() {
+                            break;
                         }
 
+                        match client.next_command().await {
+                            Ok(_) => {
+                                warn!("TODO Actually handle commands");
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive a command: {e}");
+                                break;
+                            }
+                        }
                     }
+                });
+
+                let client = queue_client.clone();
+                let token = cancellation_token.clone();
+                let tracker = process_tracker.clone();
+                let process_task = tokio::spawn(async move {
+                    loop {
+                        if token.is_cancelled() {
+                            break;
+                        }
+
+                        if tracker.len() >= max_concurrency {
+                            debug!("Nothing to do.");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+
+                        match client.next_process().await {
+                            Ok(ProcessResponse {
+                                session_token,
+                                process_id,
+                                ..
+                            }) => {
+                                tracker.spawn(async move {
+                                    handle_process(agent_id, session_token, process_id).await
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive a process: {e}");
+                                break;
+                            }
+                        }
+                    }
+                });
+                
+                loop {
+                    if cancellation_token.is_cancelled() {
+                        command_task.abort();
+                        process_task.abort();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+
+                let _ = tokio::join!(command_task, process_task); // TODO ?
             }
             Err(e) => {
                 warn!("Queue client error: {e}. Reconnecting in 5 seconds...");
@@ -122,9 +166,18 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    debug!("Shutting down...");
-    tracker.close();
-    tracker.wait().await;
+    process_tracker.close();
+
+    if !process_tracker.is_empty() {
+        info!(
+            "Shutting down... Waiting for {} processes to finish.",
+            process_tracker.len()
+        );
+    }
+    process_tracker.wait().await;
+
+    info!("Bye!");
+
     Ok(())
 }
 
