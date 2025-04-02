@@ -27,4 +27,5 @@ uuid = { version = "1", features = ["serde"] }
 [profile.release]
 lto = "fat"
 opt-level = "z"
+strip = true
 debug = false
