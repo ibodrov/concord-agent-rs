@@ -11,5 +11,8 @@ flows:
           - bar
           - baz
           - qux
-    - ${sleep.ms(30000)}
+    - ${sleep.ms(1000)}
     - log: Bye!
+    - task: throw
+      in:
+        exception: "boom!"

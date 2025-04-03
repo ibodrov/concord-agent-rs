@@ -236,17 +236,26 @@ async fn handle_process(
         agent_id,
         api: ApiConfiguration { base_url },
     };
-    runner::run(&runner_cfg, process_id, &work_dir, &process_api).await?;
+
+    let result = runner::run(&runner_cfg, process_id, &work_dir, &process_api).await?;
 
     // TODO upload attachments
 
-    // mark as FINISHED
-    process_api
-        .update_status(process_id, agent_id, ProcessStatus::Finished)
-        .await
-        .context("Failed to update process status to FINISHED")?;
-
-    info!(status = ?ProcessStatus::Finished);
+    if result.code == 0 {
+        // mark as FINISHED
+        info!(status = ?ProcessStatus::Finished);
+        process_api
+            .update_status(process_id, agent_id, ProcessStatus::Finished)
+            .await
+            .context("Failed to update process status to FINISHED")?;
+    } else {
+        // mark as FAILED
+        info!(status = ?ProcessStatus::Failed);
+        process_api
+            .update_status(process_id, agent_id, ProcessStatus::Failed)
+            .await
+            .context("Failed to update process status to FAILED")?;
+    }
 
     Ok(())
 }

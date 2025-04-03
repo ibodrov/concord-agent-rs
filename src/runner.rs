@@ -4,6 +4,7 @@ use anyhow::Context;
 use bollard::{
     Docker,
     container::{self, CreateContainerOptions, LogOutput, StartContainerOptions},
+    errors::Error::DockerContainerWaitError,
     secret::{ContainerWaitResponse, HostConfig, Mount},
 };
 use bytes::Bytes;
@@ -28,12 +29,16 @@ pub struct RunnerConfiguration {
     pub api: ApiConfiguration,
 }
 
+pub struct ContainerRunResult {
+    pub code: i64,
+}
+
 pub async fn run<'a>(
     runner_cfg: &RunnerConfiguration,
     process_id: ProcessId,
     work_dir: &Path,
     process_api: &'a ProcessApiClient<'a>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ContainerRunResult> {
     // Prepare the runner.json file
     let runner_json =
         serde_json::to_string(runner_cfg).context("Failed to serialize runner.json")?;
@@ -119,11 +124,22 @@ pub async fn run<'a>(
 
                 for segment_header_parser::Segment { header, msg_start } in segments {
                     if header.length > 0 {
-                        let msg = message[msg_start..msg_start + header.length].to_vec();
-                        process_api
-                            .append_to_log_segment(process_id, header.segment_id, Bytes::from(msg))
-                            .await
-                            .context("Error while appending to a log segment")?;
+                        if msg_start + header.length >= message.len() {
+                            warn!(
+                                "Invalid log segment length: msg_start={}, header.length={}",
+                                msg_start, header.length
+                            );
+                        } else {
+                            let msg = message[msg_start..msg_start + header.length].to_vec();
+                            process_api
+                                .append_to_log_segment(
+                                    process_id,
+                                    header.segment_id,
+                                    Bytes::from(msg),
+                                )
+                                .await
+                                .context("Error while appending to a log segment")?;
+                        }
                     }
 
                     process_api
@@ -165,7 +181,11 @@ pub async fn run<'a>(
         match result {
             Ok(ContainerWaitResponse { status_code, .. }) => {
                 debug!(status_code);
-                return Ok(());
+                return Ok(ContainerRunResult { code: status_code });
+            }
+            Err(DockerContainerWaitError { error, code }) => {
+                warn!("Container finished with error={error}, code={code}");
+                return Ok(ContainerRunResult { code });
             }
             Err(e) => {
                 anyhow::bail!("Error while waiting for container: {:?}", e);
@@ -231,7 +251,7 @@ mod segment_header_parser {
                 0 => Ok(LogSegmentStatus::Running),
                 1 => Ok(LogSegmentStatus::Ok),
                 2 => Ok(LogSegmentStatus::Suspended),
-                3 => Ok(LogSegmentStatus::Error),
+                3 => Ok(LogSegmentStatus::Failed),
                 _ => anyhow::bail!("Invalid segment_status value: {i}"),
             }
         }
