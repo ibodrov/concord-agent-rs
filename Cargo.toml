@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async_zip = { version = "0", features = ["tokio", "deflate"] }
+async-tempfile = "0"
 bollard = "0"
 bytes = "1"
 concord-client = { path = "../concord-client-rs" }
@@ -23,9 +24,8 @@ tracing = "0"
 tracing-subscriber = "0"
 url = "2"
 uuid = { version = "1", features = ["serde"] }
+walkdir = "2"
 
 [profile.release]
-lto = "fat"
-opt-level = "z"
 strip = true
 debug = false

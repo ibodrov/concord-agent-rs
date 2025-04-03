@@ -13,6 +13,7 @@ flows:
           - qux
     - ${sleep.ms(1000)}
     - log: Bye!
-    - task: throw
-      in:
-        exception: "boom!"
+    - suspend: test
+    # - task: throw
+    #   in:
+    #     exception: "boom!"

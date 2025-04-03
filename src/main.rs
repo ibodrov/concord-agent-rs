@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
+use async_tempfile::TempFile;
 use concord_client::{
     api_client::{self, ApiClient},
     model::{AgentId, ApiToken, ProcessId, ProcessStatus, SessionToken},
@@ -16,7 +17,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, info, warn};
 use url::Url;
-use utils::unzip;
+use utils::{unzip, zip_directory};
 
 mod controller;
 mod runner;
@@ -239,7 +240,23 @@ async fn handle_process(
 
     let result = runner::run(&runner_cfg, process_id, &work_dir, &process_api).await?;
 
-    // TODO upload attachments
+    // upload attachments
+    let attachments_dir = work_dir.join("_attachments");
+    if tokio::fs::metadata(&attachments_dir).await.is_ok() {
+        match TempFile::new().await {
+            Ok(tmp_file) => {
+                if let Err(e) = zip_directory(&attachments_dir, tmp_file.file_path()).await {
+                    warn!("Failed to archive process attachments: {e}");
+                }
+                debug!("Archived process attachments as {tmp_file:?}");
+            }
+            Err(e) => {
+                warn!("Failed to create a temporary file to zip process attachments: {e}");
+            }
+        }
+    } else {
+        debug!("No process attachments found.");
+    }
 
     if result.code == 0 {
         // mark as FINISHED

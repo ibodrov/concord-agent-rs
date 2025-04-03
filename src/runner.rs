@@ -126,8 +126,10 @@ pub async fn run<'a>(
                     if header.length > 0 {
                         if msg_start + header.length >= message.len() {
                             warn!(
-                                "Invalid log segment length: msg_start={}, header.length={}",
-                                msg_start, header.length
+                                "Invalid log segment length: msg_start={}, header.length={}, message={}",
+                                msg_start,
+                                header.length,
+                                String::from_utf8_lossy(&message)
                             );
                         } else {
                             let msg = message[msg_start..msg_start + header.length].to_vec();
